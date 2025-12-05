@@ -4,7 +4,8 @@ This project is a small, end to end proof of concept that checks automotive deal
 
 ## Live Demo
 
-Streamlit app: https://roboflowdemo-wtv8hsux5c6rwis9jxvyok.streamlit.app/
+Streamlit app: https://roboflowdemo-wtv8hsux5c6rwis9jxvyok.streamlit.app
+
 Code: https://github.com/nrlafata/roboflow_demo
 
 - **Input:** a dealer commercial (MP4) and the expected OEM  
@@ -106,6 +107,7 @@ The same pattern can be extended to support additional OEMs, competitor logos, d
 ├── README.md         # This file
 ├── .gitignore        # Files that should not be committed
 └── .env.example      # Example environment variables (no real secrets)
+
 
 
 

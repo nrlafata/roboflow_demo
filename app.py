@@ -8,7 +8,7 @@ import requests
 import streamlit as st
 
 # --------- CONFIG ---------
-MODEL_ID = "my-first-project-9d4yc2"
+MODEL_ID = "my-first-project-9d4yc/2"
 API_KEY = "YbOtOHJd3JSXN9ARUJrM"
 
 OEM_CONFIG = {
@@ -217,3 +217,4 @@ if analyze_clicked:
 else:
     st.info("Upload a video and click **Run Compliance Check** to get started.")
 # -------------------------------
+

@@ -1,0 +1,4 @@
+requests ##to call Roboflow API
+opencv-python ##to read videos and grab frames
+streamlit #for the tiny UI
+python-dotenv ## to load ROBOFLOW_API_KEY from .env

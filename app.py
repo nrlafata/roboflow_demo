@@ -1,61 +1,85 @@
 import os
 import json
 import tempfile
-from pathlib import Path
 
 import cv2
-import requests
 import streamlit as st
+from inference_sdk import InferenceHTTPClient
 
-# --------- CONFIG ---------
-MODEL_ID = "my-first-project-9d4yc/2"
-API_KEY = "YbOtOHJd3JSXN9ARUJrM"
+# --------------------------
+# Workflow config
+# --------------------------
+API_KEY = st.secrets.get("ROBOFLOW_API_KEY", os.environ.get("ROBOFLOW_API_KEY", ""))
+WORKSPACE_NAME = st.secrets.get("ROBOFLOW_WORKSPACE", os.environ.get("ROBOFLOW_WORKSPACE", ""))
+WORKFLOW_ID = st.secrets.get("ROBOFLOW_WORKFLOW_ID", os.environ.get("ROBOFLOW_WORKFLOW_ID", ""))
+
+# Workflows run on serverless
+ROBOFLOW_API_URL = os.environ.get("ROBOFLOW_API_URL", "https://serverless.roboflow.com")
 
 OEM_CONFIG = {
     "Mitsubishi": {
         "class_name": "mitsubishi_logo",
-        "min_logo_ratio": 0.30,   # require logo in 30% of frames
+        "min_logo_ratio": 0.30,
     },
-    # Later, add more OEMs here with their class names and thresholds
 }
 
-CONFIDENCE_THRESHOLD = 0.5  # minimum confidence to count a detection
-SAMPLE_FPS = 1.0            # sample 1 frame per second
-# --------------------------
+CONFIDENCE_THRESHOLD_DEFAULT = 0.5
+SAMPLE_FPS_DEFAULT = 1.0
 
 
-# ---------- CORE LOGIC ----------
-def call_roboflow_frame(frame_bgr):
-    """Encode one frame to JPEG and send to Roboflow as a file upload."""
-    success, buffer = cv2.imencode(".jpg", frame_bgr)
-    if not success:
-        raise RuntimeError("Could not encode frame to JPEG")
+@st.cache_resource
+def get_rf_client():
+    if not API_KEY:
+        raise RuntimeError("Missing ROBOFLOW_API_KEY. Set it in Streamlit secrets or an env var.")
+    return InferenceHTTPClient(api_url=ROBOFLOW_API_URL, api_key=API_KEY)
 
-    jpg_bytes = buffer.tobytes()
 
-    url = f"https://detect.roboflow.com/{MODEL_ID}"
-    params = {
-        "api_key": API_KEY,
-        "format": "json",
-        "confidence": CONFIDENCE_THRESHOLD,
-    }
+def _find_key_anywhere(obj, key):
+    if isinstance(obj, dict):
+        if key in obj:
+            return obj[key]
+        for v in obj.values():
+            found = _find_key_anywhere(v, key)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for item in obj:
+            found = _find_key_anywhere(item, key)
+            if found is not None:
+                return found
+    return None
 
-    files = {
-        "file": ("frame.jpg", jpg_bytes, "image/jpeg")
-    }
 
-    resp = requests.post(url, params=params, files=files, timeout=30)
-    if not resp.ok:
-        # this will show up in the Streamlit log if something goes wrong
-        print("Roboflow error:", resp.status_code, resp.text)
-        resp.raise_for_status()
+def call_workflow_frame(frame_bgr, confidence_threshold, target_class, debug=False):
+   
+    if not WORKSPACE_NAME or not WORKFLOW_ID:
+        raise RuntimeError("Missing ROBOFLOW_WORKSPACE or ROBOFLOW_WORKFLOW_ID.")
 
-    data = resp.json()
-    return data.get("predictions", [])
+    client = get_rf_client()
+
+    result = client.run_workflow(
+        workspace_name=WORKSPACE_NAME,
+        workflow_id=WORKFLOW_ID,
+        images={"image": frame_bgr},  # must match your Workflow Input name: "image"
+        parameters={
+            "confidence_threshold": confidence_threshold,
+            "target_class": target_class,
+        },
+        use_cache=False,  # helpful while iterating
+    )
+
+    frame_has_logo = _find_key_anywhere(result, "frame_has_logo")
+    best_conf = _find_key_anywhere(result, "best_confidence")
+
+    frame_has_logo = bool(frame_has_logo) if frame_has_logo is not None else False
+    best_conf = float(best_conf) if best_conf is not None else 0.0
+
+    if debug:
+        return frame_has_logo, best_conf, result
+    return frame_has_logo, best_conf, None
 
 
 def sample_frames(video_path: str, fps: float = 1.0):
-    """Return list of (timestamp_seconds, frame_bgr) sampled at `fps`."""
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video: {video_path}")
@@ -84,16 +108,9 @@ def sample_frames(video_path: str, fps: float = 1.0):
     return frames
 
 
-def evaluate_compliance(frames_with_dets, class_name: str, min_logo_ratio: float):
-    """Turn per-frame detections into a simple compliance verdict."""
-    total_frames = len(frames_with_dets)
-    logo_times = []
-
-    for entry in frames_with_dets:
-        t = entry["time"]
-        classes = [d["class"] for d in entry["detections"]]
-        if class_name in classes:
-            logo_times.append(t)
+def evaluate_compliance(frames_eval, min_logo_ratio: float):
+    total_frames = len(frames_eval)
+    logo_times = [e["time"] for e in frames_eval if e.get("frame_has_logo")]
 
     if total_frames == 0:
         return {
@@ -109,16 +126,10 @@ def evaluate_compliance(frames_with_dets, class_name: str, min_logo_ratio: float
         reason = "OEM logo never appears in any sampled frame."
     elif ratio < min_logo_ratio:
         status = "NON_COMPLIANT"
-        reason = (
-            f"OEM logo appears in only {ratio:.0%} of sampled frames "
-            f"(threshold {min_logo_ratio:.0%})."
-        )
+        reason = f"OEM logo appears in only {ratio:.0%} of sampled frames (threshold {min_logo_ratio:.0%})."
     else:
         status = "COMPLIANT"
-        reason = (
-            f"OEM logo appears in {ratio:.0%} of sampled frames, "
-            f"meeting the {min_logo_ratio:.0%} threshold."
-        )
+        reason = f"OEM logo appears in {ratio:.0%} of sampled frames, meeting the {min_logo_ratio:.0%} threshold."
 
     return {
         "status": status,
@@ -130,39 +141,68 @@ def evaluate_compliance(frames_with_dets, class_name: str, min_logo_ratio: float
     }
 
 
-def analyze_video(video_path: str, oem_name: str):
-    """End-to-end analysis: sample frames, run Roboflow, evaluate rules."""
+def analyze_video(video_path: str, oem_name: str, sample_fps: float, confidence_threshold: float, debug_first_frame=False):
     cfg = OEM_CONFIG[oem_name]
     class_name = cfg["class_name"]
     min_ratio = cfg["min_logo_ratio"]
 
-    frames = sample_frames(video_path, fps=SAMPLE_FPS)
-    frames_with_dets = []
+    frames = sample_frames(video_path, fps=sample_fps)
+    frames_eval = []
+
+    raw_first = None
 
     for idx, (ts, frame) in enumerate(frames, start=1):
-        preds = call_roboflow_frame(frame)
-        frames_with_dets.append({"time": ts, "detections": preds})
+        if debug_first_frame and idx == 1:
+            frame_has_logo, best_conf, raw = call_workflow_frame(
+                frame,
+                confidence_threshold=confidence_threshold,
+                target_class=class_name,
+                debug=True
+            )
+            raw_first = raw
+        else:
+            frame_has_logo, best_conf, _ = call_workflow_frame(
+                frame,
+                confidence_threshold=confidence_threshold,
+                target_class=class_name
+            )
 
-    result = evaluate_compliance(frames_with_dets, class_name, min_ratio)
-    return result
-# -------------------------------
+        frames_eval.append({
+            "time": ts,
+            "frame_has_logo": frame_has_logo,
+            "best_confidence": best_conf
+        })
+
+    result = evaluate_compliance(frames_eval, min_ratio)
+    return result, raw_first
 
 
-# ---------- STREAMLIT UI ----------
+# --------------------------
+# Streamlit UI
+# --------------------------
 st.set_page_config(page_title="Dealer Video Compliance Checker", layout="centered")
 
-st.title(" Dealer Video Compliance Checker")
+st.title("Dealer Video Compliance Checker")
 st.write(
-    "Upload a dealer commercial, select the expected OEM, and this tool will "
-    "sample the video, run it through a Roboflow logo detector, and check "
-    "whether the OEM logo appears frequently enough to be considered compliant."
+    "Upload a dealer commercial, select the expected OEM, and this tool will sample the video, "
+    "call a Roboflow Workflow on each sampled frame, and check whether the OEM logo appears frequently enough."
 )
+
+with st.expander("Workflow configuration"):
+    st.write("These must be set via Streamlit secrets or environment variables.")
+    st.code(
+        "ROBOFLOW_API_KEY\nROBOFLOW_WORKSPACE\nROBOFLOW_WORKFLOW_ID",
+        language="text"
+    )
+    st.write(f"Workspace: {WORKSPACE_NAME or '(missing)'}")
+    st.write(f"Workflow ID: {WORKFLOW_ID or '(missing)'}")
 
 oem_name = st.selectbox("Expected OEM", list(OEM_CONFIG.keys()))
+confidence_threshold = st.slider("Confidence threshold", 0.0, 1.0, float(CONFIDENCE_THRESHOLD_DEFAULT), 0.01)
+sample_fps = st.slider("Sample FPS", 0.25, 5.0, float(SAMPLE_FPS_DEFAULT), 0.25)
+debug_first_frame = st.checkbox("Show raw workflow response for first frame (proof)", value=True)
 
-uploaded_video = st.file_uploader(
-    "Upload MP4 video", type=["mp4", "mov", "m4v"], accept_multiple_files=False
-)
+uploaded_video = st.file_uploader("Upload MP4 video", type=["mp4", "mov", "m4v"], accept_multiple_files=False)
 
 analyze_clicked = st.button("Run Compliance Check", type="primary")
 
@@ -170,51 +210,53 @@ if analyze_clicked:
     if uploaded_video is None:
         st.error("Please upload a video first.")
     else:
-        # Save upload to a temp file so OpenCV can read it
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
             tmp.write(uploaded_video.read())
             temp_video_path = tmp.name
 
-        with st.spinner("Analyzing video... this may take a moment."):
+        with st.spinner("Analyzing video..."):
             try:
-                result = analyze_video(temp_video_path, oem_name)
+                result, raw_first = analyze_video(
+                    temp_video_path,
+                    oem_name,
+                    sample_fps=sample_fps,
+                    confidence_threshold=confidence_threshold,
+                    debug_first_frame=debug_first_frame
+                )
             finally:
-                # clean up temp file
                 try:
                     os.remove(temp_video_path)
                 except OSError:
                     pass
 
-        # ---------- Display results ----------
         status = result.get("status", "UNKNOWN")
         reason = result.get("reason", "")
-        frames_total = result.get("frames_total", 0)
-        frames_with_logo = result.get("frames_with_logo", 0)
-        ratio = result.get("logo_frame_ratio", 0.0)
-        times = result.get("logo_example_times", [])
 
         if status == "COMPLIANT":
-            st.success(f" COMPLIANT – {reason}")
+            st.success(f"COMPLIANT: {reason}")
         elif status == "NON_COMPLIANT":
-            st.error(f" NON-COMPLIANT – {reason}")
+            st.error(f"NON-COMPLIANT: {reason}")
         else:
-            st.warning(f" {status} – {reason}")
+            st.warning(f"{status}: {reason}")
 
         col1, col2, col3 = st.columns(3)
         with col1:
-            st.metric("Total Sampled Frames", frames_total)
+            st.metric("Total Sampled Frames", result.get("frames_total", 0))
         with col2:
-            st.metric("Frames with Logo", frames_with_logo)
+            st.metric("Frames with Logo", result.get("frames_with_logo", 0))
         with col3:
-            st.metric("Logo Frame Ratio", f"{ratio:.0%}")
+            st.metric("Logo Frame Ratio", f"{result.get('logo_frame_ratio', 0.0):.0%}")
 
+        times = result.get("logo_example_times", [])
         if times:
             st.write("Example timestamps (seconds) where logo was detected:")
             st.write(", ".join(f"{t:.1f}" for t in times))
 
+        if raw_first is not None:
+            st.subheader("Workflow raw response (first frame)")
+            st.json(raw_first)
+
         st.subheader("Raw Result JSON")
         st.json(result)
 else:
-    st.info("Upload a video and click **Run Compliance Check** to get started.")
-# -------------------------------
-
+    st.info("Upload a video and click Run Compliance Check to get started.")

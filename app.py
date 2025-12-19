@@ -1,10 +1,7 @@
 import os
 import json
 import tempfile
-
-import cv2
 import streamlit as st
-from inference_sdk import InferenceHTTPClient
 
 # --------------------------
 # Workflow config
@@ -260,3 +257,4 @@ if analyze_clicked:
         st.json(result)
 else:
     st.info("Upload a video and click Run Compliance Check to get started.")
+

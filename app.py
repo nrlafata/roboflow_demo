@@ -1,17 +1,31 @@
 import os
 import json
+import base64
 import tempfile
+import subprocess
+from pathlib import Path
+
 import streamlit as st
+import requests
+from imageio_ffmpeg import get_ffmpeg_exe
+
+# --------------------------
+# Safe config loading
+# --------------------------
+def get_setting(key: str, default: str = "") -> str:
+    # st.secrets throws if secrets.toml doesn't exist; handle gracefully
+    try:
+        return st.secrets.get(key, os.environ.get(key, default))
+    except Exception:
+        return os.environ.get(key, default)
 
 # --------------------------
 # Workflow config
 # --------------------------
-API_KEY = st.secrets.get("ROBOFLOW_API_KEY", os.environ.get("ROBOFLOW_API_KEY", ""))
-WORKSPACE_NAME = st.secrets.get("ROBOFLOW_WORKSPACE", os.environ.get("ROBOFLOW_WORKSPACE", ""))
-WORKFLOW_ID = st.secrets.get("ROBOFLOW_WORKFLOW_ID", os.environ.get("ROBOFLOW_WORKFLOW_ID", ""))
-
-# Workflows run on serverless
-ROBOFLOW_API_URL = os.environ.get("ROBOFLOW_API_URL", "https://serverless.roboflow.com")
+API_KEY = get_setting("ROBOFLOW_API_KEY")
+WORKSPACE_NAME = get_setting("ROBOFLOW_WORKSPACE")
+WORKFLOW_ID = get_setting("ROBOFLOW_WORKFLOW_ID")
+ROBOFLOW_API_URL = get_setting("ROBOFLOW_API_URL", "https://serverless.roboflow.com")
 
 OEM_CONFIG = {
     "Mitsubishi": {
@@ -22,13 +36,6 @@ OEM_CONFIG = {
 
 CONFIDENCE_THRESHOLD_DEFAULT = 0.5
 SAMPLE_FPS_DEFAULT = 1.0
-
-
-@st.cache_resource
-def get_rf_client():
-    if not API_KEY:
-        raise RuntimeError("Missing ROBOFLOW_API_KEY. Set it in Streamlit secrets or an env var.")
-    return InferenceHTTPClient(api_url=ROBOFLOW_API_URL, api_key=API_KEY)
 
 
 def _find_key_anywhere(obj, key):
@@ -47,23 +54,34 @@ def _find_key_anywhere(obj, key):
     return None
 
 
-def call_workflow_frame(frame_bgr, confidence_threshold, target_class, debug=False):
-   
+def call_workflow_frame_jpg_bytes(jpg_bytes: bytes, confidence_threshold: float, target_class: str, debug: bool = False):
+    """
+    Calls your Roboflow Workflow using plain HTTP.
+    No inference_sdk. No cv2.
+    """
+    if not API_KEY:
+        raise RuntimeError("Missing ROBOFLOW_API_KEY.")
     if not WORKSPACE_NAME or not WORKFLOW_ID:
         raise RuntimeError("Missing ROBOFLOW_WORKSPACE or ROBOFLOW_WORKFLOW_ID.")
 
-    client = get_rf_client()
+    b64 = base64.b64encode(jpg_bytes).decode("utf-8")
 
-    result = client.run_workflow(
-        workspace_name=WORKSPACE_NAME,
-        workflow_id=WORKFLOW_ID,
-        images={"image": frame_bgr},  # must match your Workflow Input name: "image"
-        parameters={
-            "confidence_threshold": confidence_threshold,
-            "target_class": target_class,
+    url = f"{ROBOFLOW_API_URL}/{WORKSPACE_NAME}/workflows/{WORKFLOW_ID}"
+    payload = {
+        "api_key": API_KEY,
+        "inputs": {
+            # must match your workflow input name: "image"
+            "image": {"type": "base64", "value": b64}
         },
-        use_cache=False,  # helpful while iterating
-    )
+        "parameters": {
+            "confidence_threshold": float(confidence_threshold),
+            "target_class": str(target_class),
+        }
+    }
+
+    resp = requests.post(url, json=payload, timeout=60)
+    resp.raise_for_status()
+    result = resp.json()
 
     frame_has_logo = _find_key_anywhere(result, "frame_has_logo")
     best_conf = _find_key_anywhere(result, "best_confidence")
@@ -76,33 +94,39 @@ def call_workflow_frame(frame_bgr, confidence_threshold, target_class, debug=Fal
     return frame_has_logo, best_conf, None
 
 
-def sample_frames(video_path: str, fps: float = 1.0):
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open video: {video_path}")
+def sample_frames_ffmpeg(video_path: str, fps: float = 1.0):
+    """
+    Extract frames using ffmpeg (bundled via imageio-ffmpeg).
+    Returns list of (timestamp_seconds, jpg_bytes).
+    Timestamps are approximated as frame_index / fps which is fine for demo purposes.
+    """
+    ffmpeg = get_ffmpeg_exe()
 
-    native_fps = cap.get(cv2.CAP_PROP_FPS)
-    if native_fps <= 0:
-        native_fps = fps
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out_pattern = str(Path(tmpdir) / "frame_%06d.jpg")
 
-    frame_interval = max(int(round(native_fps / fps)), 1)
-    frames = []
-    frame_idx = 0
-    ts = 0.0
+        # -vf fps=... samples frames
+        # -q:v controls jpeg quality (2 is high quality)
+        cmd = [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel", "error",
+            "-i", video_path,
+            "-vf", f"fps={fps}",
+            "-q:v", "2",
+            out_pattern
+        ]
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+        subprocess.run(cmd, check=True)
 
-        if frame_idx % frame_interval == 0:
-            frames.append((ts, frame))
-            ts += 1.0
+        frames = sorted(Path(tmpdir).glob("frame_*.jpg"))
+        results = []
+        for i, frame_path in enumerate(frames):
+            ts = i / float(fps)
+            jpg_bytes = frame_path.read_bytes()
+            results.append((ts, jpg_bytes))
 
-        frame_idx += 1
-
-    cap.release()
-    return frames
+        return results
 
 
 def evaluate_compliance(frames_eval, min_logo_ratio: float):
@@ -138,30 +162,30 @@ def evaluate_compliance(frames_eval, min_logo_ratio: float):
     }
 
 
-def analyze_video(video_path: str, oem_name: str, sample_fps: float, confidence_threshold: float, debug_first_frame=False):
+def analyze_video(video_path: str, oem_name: str, sample_fps: float, confidence_threshold: float, debug_first_frame: bool = False):
     cfg = OEM_CONFIG[oem_name]
     class_name = cfg["class_name"]
     min_ratio = cfg["min_logo_ratio"]
 
-    frames = sample_frames(video_path, fps=sample_fps)
+    frames = sample_frames_ffmpeg(video_path, fps=sample_fps)
     frames_eval = []
-
     raw_first = None
 
-    for idx, (ts, frame) in enumerate(frames, start=1):
+    for idx, (ts, jpg_bytes) in enumerate(frames, start=1):
         if debug_first_frame and idx == 1:
-            frame_has_logo, best_conf, raw = call_workflow_frame(
-                frame,
+            frame_has_logo, best_conf, raw = call_workflow_frame_jpg_bytes(
+                jpg_bytes,
                 confidence_threshold=confidence_threshold,
                 target_class=class_name,
                 debug=True
             )
             raw_first = raw
         else:
-            frame_has_logo, best_conf, _ = call_workflow_frame(
-                frame,
+            frame_has_logo, best_conf, _ = call_workflow_frame_jpg_bytes(
+                jpg_bytes,
                 confidence_threshold=confidence_threshold,
-                target_class=class_name
+                target_class=class_name,
+                debug=False
             )
 
         frames_eval.append({
@@ -187,12 +211,14 @@ st.write(
 
 with st.expander("Workflow configuration"):
     st.write("These must be set via Streamlit secrets or environment variables.")
-    st.code(
-        "ROBOFLOW_API_KEY\nROBOFLOW_WORKSPACE\nROBOFLOW_WORKFLOW_ID",
-        language="text"
-    )
+    st.code("ROBOFLOW_API_KEY\nROBOFLOW_WORKSPACE\nROBOFLOW_WORKFLOW_ID", language="text")
     st.write(f"Workspace: {WORKSPACE_NAME or '(missing)'}")
     st.write(f"Workflow ID: {WORKFLOW_ID or '(missing)'}")
+    st.write(f"API URL: {ROBOFLOW_API_URL}")
+
+if not API_KEY or not WORKSPACE_NAME or not WORKFLOW_ID:
+    st.error("Missing Roboflow config. Set ROBOFLOW_API_KEY, ROBOFLOW_WORKSPACE, ROBOFLOW_WORKFLOW_ID.")
+    st.stop()
 
 oem_name = st.selectbox("Expected OEM", list(OEM_CONFIG.keys()))
 confidence_threshold = st.slider("Confidence threshold", 0.0, 1.0, float(CONFIDENCE_THRESHOLD_DEFAULT), 0.01)
@@ -200,7 +226,6 @@ sample_fps = st.slider("Sample FPS", 0.25, 5.0, float(SAMPLE_FPS_DEFAULT), 0.25)
 debug_first_frame = st.checkbox("Show raw workflow response for first frame (proof)", value=True)
 
 uploaded_video = st.file_uploader("Upload MP4 video", type=["mp4", "mov", "m4v"], accept_multiple_files=False)
-
 analyze_clicked = st.button("Run Compliance Check", type="primary")
 
 if analyze_clicked:
@@ -237,12 +262,9 @@ if analyze_clicked:
             st.warning(f"{status}: {reason}")
 
         col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Total Sampled Frames", result.get("frames_total", 0))
-        with col2:
-            st.metric("Frames with Logo", result.get("frames_with_logo", 0))
-        with col3:
-            st.metric("Logo Frame Ratio", f"{result.get('logo_frame_ratio', 0.0):.0%}")
+        col1.metric("Total Sampled Frames", result.get("frames_total", 0))
+        col2.metric("Frames with Logo", result.get("frames_with_logo", 0))
+        col3.metric("Logo Frame Ratio", f"{result.get('logo_frame_ratio', 0.0):.0%}")
 
         times = result.get("logo_example_times", [])
         if times:
@@ -257,4 +279,3 @@ if analyze_clicked:
         st.json(result)
 else:
     st.info("Upload a video and click Run Compliance Check to get started.")
-
